@@ -55,17 +55,35 @@ recent observation.
 `final_url` / `url_contains` / `dom_contains` / `answer_equals`. Sparse 0/1 outcome
 reward by default (least reward-hackable); extend `_score()` with new keys as needed.
 
-**Rule reward vs. the validated recipe (read this).** The `verify()` in this PR is
-**rule-based** and is the environment default: it checks the final URL / a URL
-substring / visible DOM text / the reported answer. It is deterministic, free, and
-CI-safe, which is exactly what you want for the bundled offline `site/` tasks. It is
-**not** what produced our reference training result. The production-validated recipe
-scores whole trajectories with an **LLM judge** (trajectory-level, binary yes/no) —
-that is how real WebVoyager tasks (which have no rule-checkable end state) were graded
-in the 0721 run cited under [Training](#training-reference-result). Treat the LLM
-judge as a planned extension (drop a judge-backed `_score()` branch behind a new
-`verifier_metadata` key such as `llm_judge`); do **not** read the rule reward as the
-validated reward.
+**Two reward paths ship in this env:**
+
+1. **Rule-based (default).** Deterministic, free, CI-safe — right for the bundled
+   offline `site/` tasks. Zero external dependencies; nothing changes unless you
+   opt in to the judge.
+2. **Trajectory-level LLM judge (opt-in; the validated reward).** Real WebVoyager
+   tasks have no rule-checkable end state — the reference training result under
+   [Training](#training-reference-result) was produced by a binary trajectory
+   judge, and `judge.py` ports it with the **verbatim** validated judge prompt
+   (structured `{"reason","verdict":"yes|no"}` output; a SHA-256 unit test pins
+   the wording). The judge sees the policy-delivered action/tool-result
+   trajectory, the final live-browser URL/snapshot and the final answer
+   (`<think>` blocks are stripped), samples at temperature 0 with up to 3
+   attempts, and a failed judge is reported as `judge_status: "error"` — never
+   conflated with a "no" verdict (the rollout still gets reward 0.0 for
+   training-side safety, but the failure is visible in logs and in the verify
+   response).
+
+   Activation requires **both**:
+   ```bash
+   export JUDGE_BASE_URL=https://your-openai-compatible-gateway/v1
+   export JUDGE_API_KEY=sk-...
+   export JUDGE_MODEL=deepseek-v4-flash    # the validated judge model
+   ```
+   and a task that opts in (`verifier_metadata: {"judge": true}` — every row
+   emitted by `scripts/convert_webvoyager.py --judge` / `fetch_webvoyager.sh`),
+   or `judge_default: true` in `configs/lexmount_browser.yaml` to judge all
+   tasks. With no `JUDGE_*` env vars, behavior is byte-for-byte the rule-based
+   default. Unit tests (`tests/test_judge.py`) run against a mocked endpoint.
 
 ## Run
 
@@ -169,7 +187,7 @@ export LEXMOUNT_API_KEY=... LEXMOUNT_PROJECT_ID=... LEXMOUNT_BASE_URL=...
 bash example.sh rollout --backend lexmount
 ```
 
-## Data (WebVoyager bridge)
+## Data (WebVoyager bridge + the validated 168-task training set)
 
 `scripts/convert_webvoyager.py` maps WebVoyager-style task JSON
 (`{web_name, id, ques, web}`, [MinorJerry/WebVoyager](https://github.com/MinorJerry/WebVoyager),
@@ -177,19 +195,33 @@ bash example.sh rollout --backend lexmount
 `verifier_metadata`), following the cleaning conventions of the validated 0721
 pipeline (row-count / SHA-256 validation, duplicate-id rejection, source-id
 preservation, task-agnostic system prompt — no answers or synthetic data injected).
-The full 600-task WebVoyager set is **not bundled** (fetch it from upstream); three
+The full WebVoyager set is **not bundled** (fetch it from upstream); three
 sample tasks (Allrecipes--0 / Amazon--0 / GitHub--0) ship **already converted** in
 `data/webvoyager_sample.jsonl` (directly usable as rollout input — Stage C uses it);
 their raw upstream form is embedded in the converter for `--selftest`.
 
-Because WebVoyager has no rule-checkable ground truth, converted rows carry a
-**conservative** `url_contains` spec (agent reached/stayed on the task host) and, with
-`--emit-judge-todo`, a `needs_llm_judge: true` marker — a rule pass is necessary but
-not sufficient; full success needs the LLM judge (see [Reward](#reward)).
+**`webvoyager-clean` — exactly what the validated run trained on.** One command
+downloads the official tasks and reproduces the 168-task training set with every
+step SHA-256-verified (byte-identical to the validated run's task manifest):
+
+```bash
+bash scripts/fetch_webvoyager.sh
+#   upstream 643 tasks (pinned commit, sha256-checked)
+#   -> drop "Cambridge Dictionary"                    = 600 tasks  sha256 b901adc3...
+#   -> keep ArXiv / BBC News / Coursera / GitHub      = 168 tasks  sha256 db0dd8c1...
+#      (the 4 sites that passed the site-availability probe; IDs cross-checked
+#       against the committed data/webvoyager_clean_task_ids.txt)
+#   -> data/webvoyager_clean.jsonl (env rollout inputs, verifier_metadata.judge: true)
+```
+
+Converted rows also carry a **conservative** `url_contains` spec (agent
+reached/stayed on the task host) as the rule-based fallback — a rule pass is
+necessary but not sufficient; full success needs the LLM judge (see
+[Reward](#reward)).
 ```bash
 python scripts/convert_webvoyager.py --selftest                       # no external data
 python scripts/convert_webvoyager.py --source WebVoyager_data.jsonl \
-    --output data/webvoyager_example.jsonl --limit 3 --emit-judge-todo
+    --output data/webvoyager_example.jsonl --limit 3 --judge
 ```
 
 ## Training (reference result)
@@ -197,21 +229,85 @@ python scripts/convert_webvoyager.py --source WebVoyager_data.jsonl \
 The production recipe (colleague SXH's 0721 experiment) is a GRPO, full-parameter FSDP
 run on **2×8 Ascend 910B** with **Qwen3-8B**: 8 tasks/step × 8 rollouts/task = 64
 rollouts/step, 60 steps, 4 epochs, lr 5e-6 constant, context 40960 (4096 prompt /
-36864 response), 10 assistant + 10 user turns, trajectory-level **LLM judge** reward.
-The cloud (Lexmount) arm's mean reward rose from **≈0.105** (first 10 steps) to
-**≈0.289** (last 10 steps). `configs/grpo_lexmount_browser_smoke.yaml` scales this to a
-1-GPU smoke and annotates every deviation.
+36864 response), 10 assistant + 10 user turns, trajectory-level **LLM judge** reward
+(`deepseek-v4-flash`), data = the 168-task `webvoyager-clean` set. The cloud
+(Lexmount) arm's mean reward rose from **≈0.105** (first 10 steps) to **≈0.289**
+(last 10 steps). `configs/grpo_lexmount_browser_smoke.yaml` scales this to a 1-GPU
+smoke; `configs/grpo_lexmount_browser_full.yaml` is the full recipe on 8× H100.
+Every value in both configs is annotated `validated:` or `adapted:`.
+
+## Reproducing the RL growth curve
+
+Everything needed is in this PR. Target: one node, **8× H100 80GB** (Qwen3-8B
+full-parameter FSDP + colocated vLLM TP=4 rollouts fit comfortably; the
+validated run needed 2×8 accelerators only because of 64 GB/NPU).
+
+> **Framework/hardware caveat (read first).** The reference numbers were
+> produced with **verl on Ascend 910B**; this PR trains with **NeMo-RL on
+> NVIDIA GPUs**. Same data (SHA-verified), same judge prompt (SHA-pinned), same
+> GRPO geometry, optimizer and budgets — different framework, kernels, and
+> hardware. The promise is **recipe-level consistency**: expect the reward mean
+> to climb from ≈0.10 (first 10 steps) to ≈0.29 (last 10 steps) over 60 steps,
+> with per-step noise (64-rollout batches); do not expect bit-identical curves
+> or per-step matches.
+
+```bash
+# 0. One-time setup: NeMo-RL + this Gym branch
+git clone https://github.com/NVIDIA-NeMo/RL nemo-rl && cd nemo-rl
+uv venv && source .venv/bin/activate && uv sync   # per NeMo-RL docs
+git clone -b feat/lexmount-browser https://github.com/waple0820/Gym.git \
+    3rdparty/Gym-workspace/Gym
+ENV=3rdparty/Gym-workspace/Gym/resources_servers/lexmount_browser
+
+# 1. Build the validated 168-task training set (SHA-verified end to end)
+bash $ENV/scripts/fetch_webvoyager.sh
+
+# 2. Secrets (never committed) — copy the template and fill it in
+cp $ENV/secrets.env.example $ENV/secrets.env && chmod 600 $ENV/secrets.env
+#    LEXMOUNT_API_KEY / LEXMOUNT_PROJECT_ID / LEXMOUNT_BASE_URL  (cloud browser)
+#    JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL=deepseek-v4-flash (judge)
+set -a; source $ENV/secrets.env; set +a
+
+# 3. Launch the full recipe (60 steps; ~64 concurrent browser sessions at peak)
+HF_HOME=$PWD/.cache/ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+    --config=$ENV/configs/grpo_lexmount_browser_full.yaml \
+    ++env.nemo_gym.lexmount_browser.resources_servers.lexmount_browser.backend=lexmount
+
+# 4. Read the curve: TensorBoard scalar for per-step mean reward
+tensorboard --logdir logs/grpo-lexmount-browser-full
+```
+
+Secrets checklist (all read from the environment at launch, see
+`secrets.env.example` for per-variable provenance):
+
+| Variable | Used by | Notes |
+|---|---|---|
+| `LEXMOUNT_API_KEY` / `LEXMOUNT_PROJECT_ID` / `LEXMOUNT_BASE_URL` | cloud browser backend | project must allow ~64 concurrent sessions (validated concurrency: 64 sessions / 16 creates) |
+| `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | LLM-judge reward | validated model `deepseek-v4-flash`; ≤64 judge calls per step |
+| `POLICY_*` | example.sh rollout stages only | not used by training (NeMo-RL serves the policy) |
+
+Sanity checks before the 60-step run: `bash example.sh rollout` (env wiring),
+`bash example.sh rollout --backend lexmount` (cloud browser + creds),
+`bash example.sh train` (1-GPU smoke), and a 2-step full-config dry run
+(`++grpo.max_num_steps=2`) to confirm judge calls succeed
+(`judge_status: "ok"` in logs — `"error"`/`"unconfigured"` means the judge
+gateway or env vars need fixing, and rewards would silently fall back to 0/rule).
 
 ## Files (Gym `new-environment` spec)
 - [x] `app.py` — resources server (seed_session + tools + verify)
 - [x] `backend.py` — `BrowserBackend` + `PlaywrightBackend` + `LexmountBackend` (cloud SDK)
+- [x] `judge.py` — opt-in trajectory-level LLM-judge reward (verbatim validated prompt)
 - [x] `configs/lexmount_browser.yaml`
 - [x] `configs/grpo_lexmount_browser_smoke.yaml` — 1-GPU GRPO smoke (NeMo-RL)
+- [x] `configs/grpo_lexmount_browser_full.yaml` — full validated recipe on 8× H100 (NeMo-RL)
 - [x] `site/` — bundled offline test site (deterministic tasks/CI)
 - [x] `generate_data.py` + `data/example.jsonl` — 5 example tasks (Responses-API inputs)
 - [x] `scripts/convert_webvoyager.py` + `data/webvoyager_sample.jsonl` — WebVoyager data bridge
+- [x] `scripts/fetch_webvoyager.sh` + `data/webvoyager_clean_task_ids.txt` — the validated 168-task `webvoyager-clean` set, reproducible + SHA-verified
+- [x] `secrets.env.example` — credentials template with per-variable provenance
 - [x] `tests/test_backend.py` — standalone e2e backend test
-- [x] `example.sh` — one-script Stage A/B/C reproduction
+- [x] `tests/test_judge.py` — judge unit tests against a mocked endpoint
+- [x] `example.sh` — one-script Stage A/B/C reproduction (`train --full` = growth-curve recipe)
 - [x] `requirements.txt`, `README.md`
 - [x] `data/example_rollouts.jsonl` — 5 rollouts collected against a Responses-API endpoint (reward 1.0 on the offline site)
 - [x] reward wiring validated end-to-end (Stage A); GRPO training-signal run documented above (Ascend 910B, Qwen3-8B)

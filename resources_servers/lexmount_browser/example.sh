@@ -15,7 +15,8 @@
 # Usage:
 #   bash example.sh rollout                     # Stage A (Playwright backend)
 #   bash example.sh test                        # just the standalone backend test
-#   bash example.sh train                       # Stage B (needs 1 GPU + NeMo-RL)
+#   bash example.sh train                       # Stage B smoke (needs 1 GPU + NeMo-RL)
+#   bash example.sh train --full                # Stage B FULL recipe (8x H100; growth curve)
 #   bash example.sh rollout --backend lexmount  # Stage C (needs Lexmount creds+SDK)
 #
 # Policy endpoint (Stage A / C) — pick ONE:
@@ -196,12 +197,40 @@ run_rollout() {
   cd "$REPO_ROOT" && head -1 "$out" | python3 -c 'import sys,json; print("  reward =", json.loads(sys.stdin.readline()).get("reward"))' || true
 }
 
-# --- Stage B: GRPO training smoke (1 GPU, via NeMo-RL) ---------------------- #
+# --- Stage B: GRPO training via NeMo-RL (smoke: 1 GPU / full: 8x H100) ------ #
 run_train() {
+  if [[ "$TRAIN_MODE" == "full" ]]; then
+    cat >&2 <<EOF
+
+train --full is the FULL validated recipe (Qwen3-8B GRPO, 8 tasks x 8 rollouts
+per step, 60 steps, context 40960, LLM-judge reward) on ONE node with 8x H100
+80GB, via NeMo-RL. It is intentionally NOT auto-invoked. Full walk-through:
+README "Reproducing the RL growth curve". Checklist:
+
+  1. Clone NeMo-RL and mount this Gym checkout at 3rdparty/Gym-workspace/Gym
+     (see https://docs.nvidia.com/nemo/gym/latest/ training tutorials).
+  2. Build the validated 168-task training set (SHA-verified end to end):
+       bash $ENV_REL/scripts/fetch_webvoyager.sh
+  3. Fill in $ENV_REL/secrets.env (copy from secrets.env.example):
+     LEXMOUNT_* (cloud browser) + JUDGE_* (deepseek-v4-flash judge), then
+       set -a; source $ENV_REL/secrets.env; set +a
+  4. Launch (browser backend flipped to the Lexmount cloud):
+
+     HF_HOME=\$PWD/.cache/ \\
+       uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
+         --config=3rdparty/Gym-workspace/Gym/$ENV_REL/configs/grpo_lexmount_browser_full.yaml \\
+         ++env.nemo_gym.lexmount_browser.resources_servers.lexmount_browser.backend=lexmount
+
+Expected trajectory (RECIPE-level, not bit-identical — see the config header):
+reward/mean ~0.10 (first 10 steps) -> ~0.29 (last 10 steps) over 60 steps.
+EOF
+    return 0
+  fi
   cat >&2 <<EOF
 
 Stage B runs a single-GPU GRPO training smoke through NeMo-RL (not from this repo).
 It is intentionally NOT auto-invoked, because it needs a GPU and a NeMo-RL checkout.
+(For the full 8x H100 recipe, run: bash example.sh train --full)
 
   1. Clone NeMo-RL and mount this Gym checkout at 3rdparty/Gym-workspace/Gym
      (see https://docs.nvidia.com/nemo/gym/latest/ training tutorials).
@@ -222,10 +251,12 @@ EOF
 
 # --- arg parsing ------------------------------------------------------------ #
 CMD="${1:-rollout}"; shift || true
+TRAIN_MODE="smoke"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend) BACKEND="${2:?--backend needs a value (playwright|lexmount)}"; shift 2;;
     --limit)   LIMIT="${2:?--limit needs a value}"; shift 2;;
+    --full)    TRAIN_MODE="full"; shift;;
     *) die "unknown argument: $1";;
   esac
 done

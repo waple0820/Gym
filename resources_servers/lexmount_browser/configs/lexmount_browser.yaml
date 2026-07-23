@@ -11,6 +11,11 @@ lexmount_browser:
       endpoint: null               # optional Lexmount base_url override (else LEXMOUNT_BASE_URL from env)
       browser_mode: normal         # Lexmount cloud browser mode (backend: lexmount)
       max_elements: 50             # interactive elements shown per observation
+      # Opt-in trajectory-level LLM judge (the validated reward; see judge.py).
+      # Runs only when JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL are set in
+      # the environment AND the task carries verifier_metadata.judge: true —
+      # or flip judge_default to true to judge every task.
+      judge_default: false
       # backend: lexmount reads credentials from the environment (never commit them):
       #   LEXMOUNT_API_KEY, LEXMOUNT_PROJECT_ID, LEXMOUNT_BASE_URL
 

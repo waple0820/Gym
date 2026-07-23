@@ -1,0 +1,285 @@
+# GRPO FULL-RECIPE config for the lexmount_browser environment.
+#
+# This ports ALL hyperparameters of the validated 0721 growth-curve run
+# (internal run "webvoyager-clean-domax40-20260721-formal": Qwen3-8B, GRPO,
+# full-parameter FSDP, 2x8 Ascend 910B, verl + NeMo-Gym HTTP env, 8 tasks/step
+# x 8 rollouts = 64 rollouts/step, 60 steps, 4 epochs, lr 5e-6 constant,
+# context 40960 / prompt 4096 / response 36864, <=10 assistant + 10 tool turns,
+# 1024 tokens/action, trajectory-level binary LLM judge = deepseek-v4-flash,
+# data = webvoyager-clean 168 tasks) to the NeMo-RL schema, targeting ONE node
+# with 8x H100 80GB.
+#
+# Reference trajectory: reward/mean ~0.105 (first 10 steps) -> ~0.289 (last 10
+# steps). EXPECTATION MANAGEMENT: this config promises RECIPE-level consistency,
+# not bit-identical curves — the validated run used verl on Ascend 910B; this
+# config uses NeMo-RL on NVIDIA GPUs. Same data, same reward, same GRPO
+# geometry and optimizer; different framework, kernels and hardware. Read the
+# trend (reward mean roughly tripling over 60 steps), not single points.
+#
+# Every value is annotated:
+#   validated: — identical to the 0721 run
+#   adapted:   — changed for NeMo-RL / H100; rationale given
+#
+# Prerequisites (see README "Reproducing the RL growth curve"):
+#   1. bash resources_servers/lexmount_browser/scripts/fetch_webvoyager.sh
+#      (builds data/webvoyager_clean.jsonl — 168 tasks, judge:true)
+#   2. export JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL (deepseek-v4-flash)
+#      and LEXMOUNT_API_KEY / LEXMOUNT_PROJECT_ID / LEXMOUNT_BASE_URL
+#      BEFORE launching, so the gym-spawned resources server inherits them.
+#   3. Flip the browser backend to the cloud:
+#      ++env.nemo_gym.lexmount_browser.resources_servers.lexmount_browser.backend=lexmount
+#
+# Launch (from a NeMo-RL checkout, Gym mounted at 3rdparty/Gym-workspace/Gym):
+#   uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+#       --config=3rdparty/Gym-workspace/Gym/resources_servers/lexmount_browser/configs/grpo_lexmount_browser_full.yaml
+
+grpo:
+  max_num_epochs: 4                       # validated: TOTAL_EPOCHS=4
+  num_prompts_per_step: 8                 # validated: 8 tasks/step
+  num_generations_per_prompt: 8           # validated: 8 rollouts/task (GRPO group size)
+  max_rollout_turns: 10                   # validated: max_assistant_turns=10 / max_user_turns=10
+  max_num_steps: 60                       # validated: the growth curve is read over 60 steps
+  normalize_rewards: true                 # validated GRPO setting
+  use_leave_one_out_baseline: true        # validated GRPO setting
+  val_period: 1000                        # validated: TEST_FREQ=-1 (no in-training eval; 1000 > 60 never fires)
+  val_at_start: false                     # validated: val_before_train=False
+  val_at_end: false
+  overlong_filtering: true                # validated: data.filter_overlong_prompts=True
+  advantage_clip_low: null
+  advantage_clip_high: null
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  adv_estimator:
+    name: "grpo"                          # validated: algorithm.adv_estimator=grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false   # adapted: keep ref logprobs — the validated run used a KL term (kl_loss_coef=0.001)
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo:
+    enabled: false                        # validated: synchronous GRPO step loop
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001      # validated: kl_loss_coef=0.001
+  reference_policy_kl_type: "low_var_kl"  # validated: kl_loss_type=low_var_kl
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
+  use_importance_sampling_correction: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo_lexmount_browser_full"
+  metric_name: null                       # adapted: no in-training val (TEST_FREQ=-1) -> keep latest by step
+  higher_is_better: true
+  keep_top_k: 3                           # adapted: bounded disk (validated kept every 20-step save)
+  save_period: 20                         # validated: SAVE_FREQ=20
+  checkpoint_must_save_by: null
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen3-8B"             # validated: Qwen3-8B (full-parameter)
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}   # 64 = validated 8x8
+  train_micro_batch_size: 1               # validated: ppo_micro_batch_size_per_gpu=1
+  logprob_batch_size: 1                   # validated: log_prob_micro_batch_size_per_gpu=1
+  generation_batch_size: 32
+  max_total_sequence_length: 40960        # validated: MAX_MODEL_LENGTH=40960 (prompt 4096 + response 36864)
+  precision: "bfloat16"                   # validated: bf16
+  logprob_chunk_size: null
+
+  dtensor_cfg:
+    _v2: false
+    enabled: true                         # adapted: NeMo-RL DTensor FSDP2 = the full-parameter FSDP analog of the validated verl FSDP run
+    cpu_offload: true                     # validated: fsdp param_offload=True / optimizer_offload=True
+    sequence_parallel: false              # adapted: validated used Ulysses SP=4 on 910B (64GB); 8x H100 80GB fits 40960-token micro-batches without SP
+    activation_checkpointing: true        # validated: enable_gradient_checkpointing=True
+    tensor_parallel_size: 1               # adapted: training TP not needed for 8B on 80GB cards (validated verl trained FSDP-only too)
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+
+  megatron_cfg:
+    enabled: false
+    checkpoint:
+      async_save: true
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: true                         # validated: use_dynamic_bsz=True
+    # adapted: one full-length 40960-token trajectory must fit a micro-batch
+    # (the validated run met the same constraint via 12288 tokens/GPU x SP=4).
+    train_mb_tokens: ${policy.max_total_sequence_length}
+    logprob_mb_tokens: ${policy.max_total_sequence_length}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0                      # validated: clip_grad=1.0
+  offload_optimizer_for_logprob: false
+
+  optimizer:
+    name: "torch.optim.AdamW"             # validated: Adam family
+    kwargs:
+      lr: 5.0e-6                          # validated: lr=5e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"   # validated: constant LR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024                  # validated: 1024 tokens per assistant action (ACTION_MAX_TOKENS)
+    temperature: 1.0                      # validated rollout sampling
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true                  # validated: rollout.mode=async
+      precision: ${policy.precision}
+      tensor_parallel_size: 4             # validated: rollout tensor_model_parallel_size=4 (2 engines across 8 GPUs)
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.30        # validated: 0.30 (colocated rollout + training on the same GPUs)
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      kv_cache_dtype: "auto"
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        # validated: multi_turn.format=hermes (Qwen3 hermes tool calls)
+        enable_auto_tools: true
+        tool_parser: hermes
+        # validated: the rollout also served a qwen3 reasoning parser
+        # (thinking on). Uncomment if your NeMo-RL/vLLM accepts it here;
+        # otherwise thinking still runs and <think> is stripped from judge
+        # input by the environment (judge.py _sanitize_final_answer).
+        # reasoning_parser: qwen3
+    vllm_kwargs: {}
+    colocated:
+      enabled: true                       # validated: rollout and training share the node
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: null
+  shuffle: true                           # validated: epoch-shuffled task sampling
+  num_workers: 0
+  use_multiple_dataloader: false
+  # validated data: webvoyager-clean, 168 tasks, judge:true on every row.
+  # Build it first: bash resources_servers/lexmount_browser/scripts/fetch_webvoyager.sh
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/lexmount_browser/data/webvoyager_clean.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/lexmount_browser/data/webvoyager_clean.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml   # Required, must be *_for_training
+    - resources_servers/lexmount_browser/configs/lexmount_browser.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # validated: thinking model with a qwen3 reasoning parser. If your
+          # NeMo-RL version cannot combine the reasoning parser with hermes
+          # tool calls, fall back to the smoke config's settings
+          # (uses_reasoning_parser: false + enable_thinking: false) and note
+          # the deviation.
+          uses_reasoning_parser: true
+    lexmount_browser_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 10                    # validated: <=10 assistant turns per rollout
+    # Reward: rule-based by default. The validated reward is the trajectory
+    # judge — webvoyager_clean.jsonl rows carry verifier_metadata.judge:true,
+    # which activates it once JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL are
+    # exported (validated judge model: deepseek-v4-flash; 3 attempts,
+    # temperature 0, judge errors logged as judge_status=error).
+
+logger:
+  log_dir: "logs/grpo-lexmount-browser-full"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true               # read critic/rewards mean per step for the growth curve
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "grpo-lexmount-browser"
+    name: "qwen3-8b-lexmount-browser-full"
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-lexmount-browser"
+    run_name: "qwen3-8b-lexmount-browser-full"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8                        # adapted: 1 node x 8 H100 80GB (validated: 2 nodes x 8 Ascend 910B 64GB;
+                                          # H100's larger memory + no SP requirement makes single-node feasible)
+  num_nodes: 1
