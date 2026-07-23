@@ -71,6 +71,10 @@ def main() -> None:
             },
             "initial_url": "site/index.html",
             "verifier_metadata": verifier_metadata,
+            # Required by NeMo-RL training (nemo_gym rollout_collection posts each
+            # row to row["agent_ref"]["name"] + "/run"). `gym eval run --agent ...`
+            # ignores it. Found by the 5090 pre-validation run.
+            "agent_ref": {"type": "responses_api_agents", "name": "lexmount_browser_simple_agent"},
         }
         print(json.dumps(row))
 

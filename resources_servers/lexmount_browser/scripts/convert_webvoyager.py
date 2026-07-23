@@ -178,6 +178,10 @@ def to_row(task: dict, emit_judge_todo: bool = False, judge: bool = False) -> di
         },
         "initial_url": task["web"],
         "verifier_metadata": verifier_metadata,
+        # Required by NeMo-RL training (nemo_gym rollout_collection posts each
+        # row to row["agent_ref"]["name"] + "/run"). `gym eval run --agent ...`
+        # ignores it. Found by the 5090 pre-validation run.
+        "agent_ref": {"type": "responses_api_agents", "name": "lexmount_browser_simple_agent"},
         # Provenance passthrough (ignored by seed_session/verify; handy for audit).
         "task_id": task["id"],
         "website": task["web_name"],
