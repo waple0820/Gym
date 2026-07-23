@@ -2,20 +2,18 @@
 # ---------------------------------------------------------------------------
 # lexmount_browser — one-script, reproducible walk-through for reviewers.
 #
-# Three explicit, independently runnable stages:
+# Two explicit, independently runnable stages:
 #
 #   A. rollout   (no GPU, ~minutes)  — install deps, run the backend test, start
 #                                       the Gym serving stack, collect rollouts
 #                                       over data/example.jsonl against a policy
 #                                       endpoint. THIS IS THE DEFAULT.
-#   B. train     (1 GPU)             — GRPO training smoke via NeMo-RL.
 #   C. rollout --backend lexmount    — same as A, but drives the Lexmount cloud
 #                                       browser instead of local Playwright.
 #
 # Usage:
 #   bash example.sh rollout                     # Stage A (Playwright backend)
 #   bash example.sh test                        # just the standalone backend test
-#   bash example.sh train                       # Stage B (needs 1 GPU + NeMo-RL)
 #   bash example.sh rollout --backend lexmount  # Stage C (needs Lexmount creds+SDK)
 #
 # Policy endpoint (Stage A / C) — pick ONE:
@@ -152,17 +150,17 @@ run_rollout() {
     backend_override=("+lexmount_browser.resources_servers.lexmount_browser.backend=lexmount")
     # The bundled offline tasks are file:// URIs on THIS machine — the cloud
     # browser runs elsewhere and cannot load them (net::ERR_BLOCKED_BY_ADMINISTRATOR).
-    # Stage C therefore rolls out on the 3 bundled real-web WebVoyager sample
-    # tasks, which already ship in this env's input format (conservative
-    # url_contains reward; see README "Data").
-    input="$ENV_REL/data/webvoyager_sample.jsonl"
-    out="$ENV_REL/data/webvoyager_rollouts.jsonl"
+    # Stage C therefore rolls out on 3 bundled real-web tasks against stable
+    # public pages (example.com / iana.org / wikipedia.org) with rule-checkable
+    # url_contains / dom_contains rewards.
+    input="$ENV_REL/data/cloud_example.jsonl"
+    out="$ENV_REL/data/cloud_rollouts.jsonl"
     log "Stage C — rollout with the Lexmount cloud backend (real-web sample tasks)"
   else
     log "Stage A — rollout with the local Playwright backend"
   fi
   local server_log; server_log="$(mktemp -t lexmount_browser_env_start.XXXXXX.log)"
-  # (out/input were chosen above; Stage C writes webvoyager_rollouts.jsonl)
+  # (out/input were chosen above; Stage C writes cloud_rollouts.jsonl)
   # NOTE: run in the main shell (not a subshell) so SERVER_PID is visible to the
   # EXIT trap — otherwise the serving stack outlives the script and a re-run
   # (e.g. Stage A then Stage C) talks to the stale stack with the old backend.
@@ -196,30 +194,6 @@ run_rollout() {
   cd "$REPO_ROOT" && head -1 "$out" | python3 -c 'import sys,json; print("  reward =", json.loads(sys.stdin.readline()).get("reward"))' || true
 }
 
-# --- Stage B: GRPO training smoke (1 GPU, via NeMo-RL) ---------------------- #
-run_train() {
-  cat >&2 <<EOF
-
-Stage B runs a single-GPU GRPO training smoke through NeMo-RL (not from this repo).
-It is intentionally NOT auto-invoked, because it needs a GPU and a NeMo-RL checkout.
-
-  1. Clone NeMo-RL and mount this Gym checkout at 3rdparty/Gym-workspace/Gym
-     (see https://docs.nvidia.com/nemo/gym/latest/ training tutorials).
-  2. Download the smoke policy model (Qwen/Qwen3-4B) into your HF cache.
-  3. Launch with the committed smoke config:
-
-     CUDA_VISIBLE_DEVICES=0 HF_HOME=\$PWD/.cache/ \\
-       uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
-         --config=3rdparty/Gym-workspace/Gym/$ENV_REL/configs/grpo_lexmount_browser_smoke.yaml \\
-         ++grpo.max_num_steps=3 \\
-         cluster.gpus_per_node=1
-
-The smoke config ports SXH's validated 0721 Qwen3-8B 2x8-NPU hyperparameters
-(reward 0.10 -> 0.29 over 60 steps) scaled to one GPU; each value is annotated
-with its provenance in configs/grpo_lexmount_browser_smoke.yaml.
-EOF
-}
-
 # --- arg parsing ------------------------------------------------------------ #
 CMD="${1:-rollout}"; shift || true
 while [[ $# -gt 0 ]]; do
@@ -233,8 +207,7 @@ done
 case "$CMD" in
   test)    run_backend_test;;
   rollout) run_rollout;;
-  train)   run_train;;
-  *) die "unknown command: $CMD (want: rollout | test | train)";;
+  *) die "unknown command: $CMD (want: rollout | test)";;
 esac
 
 log "Done: $CMD"
