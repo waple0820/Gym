@@ -20,6 +20,8 @@ finish); `verify()` scores task completion against the live browser state. The
 browser itself is pluggable (`backend: playwright | lexmount`) — see `backend.py`.
 """
 
+import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -39,8 +41,22 @@ from nemo_gym.server_utils import SESSION_ID_KEY
 
 try:  # package import (gym loads the resources server as a module)
     from .backend import BrowserBackend, make_backend
+    from .judge import (
+        JudgeConfig,
+        events_from_response_output,
+        judge_trajectory,
+        question_from_create_params,
+    )
 except ImportError:  # script/standalone import (python app.py, local tests)
     from backend import BrowserBackend, make_backend
+    from judge import (
+        JudgeConfig,
+        events_from_response_output,
+        judge_trajectory,
+        question_from_create_params,
+    )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class LexmountBrowserConfig(BaseResourcesServerConfig):
@@ -49,6 +65,11 @@ class LexmountBrowserConfig(BaseResourcesServerConfig):
     endpoint: Optional[str] = None     # optional LEXMOUNT_BASE_URL override (backend: lexmount)
     browser_mode: str = "normal"       # Lexmount cloud browser mode (backend: lexmount)
     max_elements: int = 50             # elements shown per observation
+    # Opt-in trajectory-level LLM judge (the validated 0721 reward; see judge.py).
+    # The judge runs only when the JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL
+    # env vars are set AND (the task carries verifier_metadata.judge: true, or
+    # judge_default is flipped to true). Otherwise verify() stays rule-based.
+    judge_default: bool = False
 
 
 class LexmountSeedSessionRequest(BaseSeedSessionRequest):
@@ -86,13 +107,20 @@ class LexmountVerifyRequest(BaseVerifyRequest):
     verifier_metadata: Optional[Dict[str, Any]] = None
 
 
-class _SessionState:
-    __slots__ = ("backend", "answer", "gt")
+class LexmountVerifyResponse(BaseVerifyResponse):
+    # extra="allow" lets the judge path attach judge_status / judge_verdict /
+    # judge_reason without changing the rule-based response shape.
+    model_config = ConfigDict(extra="allow")
 
-    def __init__(self, backend: BrowserBackend, gt: Dict[str, Any]):
+
+class _SessionState:
+    __slots__ = ("backend", "answer", "gt", "initial_url")
+
+    def __init__(self, backend: BrowserBackend, gt: Dict[str, Any], initial_url: str = ""):
         self.backend = backend
         self.answer: Optional[str] = None
         self.gt = gt
+        self.initial_url = initial_url
 
 
 class LexmountBrowserResourcesServer(SimpleResourcesServer):
@@ -149,7 +177,7 @@ class LexmountBrowserResourcesServer(SimpleResourcesServer):
             finally:
                 raise
         self._session_id_to_state[session_id] = _SessionState(
-            backend=backend, gt=(body.verifier_metadata or {})
+            backend=backend, gt=(body.verifier_metadata or {}), initial_url=initial_url
         )
         return BaseSeedSessionResponse()
 
@@ -212,20 +240,89 @@ class LexmountBrowserResourcesServer(SimpleResourcesServer):
         return ToolResponse(observation="", done=True)
 
     # ----- reward -------------------------------------------------------- #
-    async def verify(self, request: Request, body: LexmountVerifyRequest) -> BaseVerifyResponse:
+    async def verify(self, request: Request, body: LexmountVerifyRequest) -> LexmountVerifyResponse:
         session_id = request.session[SESSION_ID_KEY]
         st = self._session_id_to_state.get(session_id)
         reward = 0.0
+        judge_info: Dict[str, Any] = {}
         try:
             if st is not None:
-                reward = await self._score(st)
+                judge_cfg = JudgeConfig.from_env()
+                gt = st.gt or {}
+                task_wants_judge = bool(gt.get("judge")) or self.config.judge_default
+                if task_wants_judge and judge_cfg.enabled:
+                    reward, judge_info = await self._judge_score(st, body, judge_cfg)
+                else:
+                    if task_wants_judge and not judge_cfg.enabled:
+                        # Loud, distinguishable: the task asked for the validated
+                        # LLM-judge reward but JUDGE_* env vars are not set.
+                        LOGGER.warning(
+                            "task requested LLM judge but JUDGE_BASE_URL/JUDGE_API_KEY/"
+                            "JUDGE_MODEL are not set; falling back to the rule-based reward"
+                        )
+                        judge_info = {"judge_status": "unconfigured"}
+                    reward = await self._score(st)
         finally:
             if st is not None:
                 try:
                     await st.backend.close()
                 finally:
                     self._session_id_to_state.pop(session_id, None)
-        return BaseVerifyResponse(**body.model_dump(), reward=reward)
+        return LexmountVerifyResponse(**body.model_dump(), reward=reward, **judge_info)
+
+    async def _judge_score(
+        self, st: _SessionState, body: LexmountVerifyRequest, judge_cfg: JudgeConfig
+    ) -> tuple[float, Dict[str, Any]]:
+        """Trajectory-level binary LLM judge (the validated 0721 reward path).
+
+        Evidence = the policy-delivered rollout trace (``body.response.output``)
+        plus the final live-browser URL/snapshot — the same
+        ``judge_evidence: policy_delivered_only`` contract as the validated run.
+        A judge failure is returned as ``judge_status: "error"`` (reward 0.0 for
+        training-side safety, but never conflated with a "no" verdict).
+        """
+        events, trace_final_answer = events_from_response_output(list(body.response.output or []))
+        final_answer = st.answer if st.answer is not None else trace_final_answer
+        question = question_from_create_params(body.responses_create_params)
+
+        # Final live-browser evidence; browser errors must not crash scoring.
+        final_url, final_state = "", "Final snapshot unavailable for this browser session"
+        try:
+            final_url = await st.backend.current_url()
+            obs = await st.backend.observe()
+            final_state = obs.render(max_elements=self.config.max_elements)
+        except Exception as e:  # noqa: BLE001 — judge evidence is best-effort
+            final_state = f"Final snapshot unavailable: {type(e).__name__}"
+
+        first_observation = next((e["result"] for e in events if e["result"]), "")
+        initial_state = json.dumps(
+            {"start_url": st.initial_url, "first_observation": first_observation[:2000]},
+            ensure_ascii=False,
+        )
+
+        result = await judge_trajectory(
+            judge_cfg,
+            question=question,
+            events=events,
+            final_answer=final_answer or "",
+            initial_state=initial_state,
+            final_url=final_url,
+            final_state=final_state,
+            rubric=str((st.gt or {}).get("rubric", "")),
+        )
+        LOGGER.info(
+            "judge result: status=%s verdict=%s reward=%.1f attempts=%d (%.1fs) %s",
+            result.status, result.verdict, result.reward, result.attempt_count,
+            result.duration_seconds, result.error_message or result.reason,
+        )
+        return result.reward, {
+            "judge_status": result.status,
+            "judge_verdict": result.verdict,
+            "judge_reason": result.reason,
+            "judge_error": result.error_message,
+            "judge_attempts": result.attempt_count,
+            "judge_model": judge_cfg.model,
+        }
 
     async def _score(self, st: _SessionState) -> float:
         gt = st.gt or {}
