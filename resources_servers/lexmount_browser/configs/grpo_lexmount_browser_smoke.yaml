@@ -19,6 +19,16 @@
 # answer_equals). The 0721 result was produced with a trajectory-level LLM judge;
 # rule reward here is a runnable placeholder, not the validated reward. See the
 # README "Reward" section.
+#
+# Small-GPU notes from the first CUDA execution of this path (RTX 5090 32GB,
+# shared card, NeMo-RL 0.6.0, Qwen3-1.7B): the run needed
+#   ++policy.dtensor_cfg._v2=true               (v1 DTensor worker venv absent there)
+#   ++policy.dtensor_cfg.cpu_offload=false      (V2/AutoModel: CPU offload is
+#                                                NotImplemented on a single GPU)
+#   ++policy.max_total_sequence_length=4096 ++policy.logprob_chunk_size=1024
+#                                               (logprob pass OOMs at 8192 when
+#                                                ~10GB of the card is otherwise used)
+# On a dedicated >=24GB free GPU the committed values below should stand.
 
 grpo:
   max_num_epochs: 4                       # validated: 4 epochs in the 0721 run
@@ -71,7 +81,9 @@ grpo:
 
 loss_fn:
   reference_policy_kl_penalty: 0.001      # validated: kl_loss_coef=0.001 (low_var_kl) in the 0721 launch
-  reference_policy_kl_type: "low_var_kl"  # validated: kl_loss_type=low_var_kl
+  reference_policy_kl_type: "k3"          # validated: kl_loss_type=low_var_kl -> NeMo-RL name "k3"
+                                          # (the same Schulman low-variance KL estimator; NeMo-RL
+                                          # accepts k1/k2/k3 only - found by the 5090 pre-validation run)
   kl_input_clamp_value: 20.0
   kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
