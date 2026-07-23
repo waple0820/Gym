@@ -104,6 +104,34 @@ for _t in TOOLS:
 
 REQUIRED_FIELDS = ("web_name", "id", "ques", "web")
 
+# --------------------------------------------------------------------------- #
+# The validated "webvoyager-clean" pipeline (dataset_id: webvoyager-clean,
+# 168 tasks) — exactly what the 0721 growth-curve run trained on:
+#
+#   1. upstream MinorJerry/WebVoyager data/WebVoyager_data.jsonl
+#      (643 tasks, 15 sites)                    sha256 = CLEAN_UPSTREAM_SHA256
+#   2. drop "Cambridge Dictionary"  -> 600 tasks, sha256 = CLEAN_600_SHA256
+#   3. keep only the four sites that passed the site-availability probe
+#      (ArXiv 43 / BBC News 42 / Coursera 42 / GitHub 41)
+#                                   -> 168 tasks, sha256 = CLEAN_168_SHA256
+#
+# Steps 2-3 serialize each kept row as
+# json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n", which
+# reproduces the internal artifacts byte-for-byte (the 600-row file equals the
+# internal WebVoyager_data_clean.jsonl; the 168-row file equals the training
+# run's tasks.jsonl, task_manifest_sha256 db0dd8c1...). The 168 task IDs also
+# ship in-repo at data/webvoyager_clean_task_ids.txt and are cross-checked.
+# --------------------------------------------------------------------------- #
+CLEAN_UPSTREAM_SHA256 = "69b19fd86c23f1a500244a3724e039aa7ca6a1223d03e11eb10e308d4f11c488"
+CLEAN_UPSTREAM_ROWS = 643
+CLEAN_DROP_SITES = ("Cambridge Dictionary",)
+CLEAN_600_SHA256 = "b901adc3f1fb93c069260e1940c59b214374f0ffe58ff7dcf5b1af831d3b1097"
+CLEAN_600_ROWS = 600
+CLEAN_KEEP_SITES = ("ArXiv", "BBC News", "Coursera", "GitHub")
+CLEAN_168_SHA256 = "db0dd8c1f7b2521152caa7dbf76b28dcffa4570655f600007d3f78bd0c8727a9"
+CLEAN_168_ROWS = 168
+CLEAN_TASK_ID_LIST = Path(__file__).parent.parent / "data" / "webvoyager_clean_task_ids.txt"
+
 # Three real WebVoyager tasks (verbatim from the upstream MIT dataset) kept in the
 # repo so the converter is runnable and testable WITHOUT redistributing the full
 # 600-task set. These are the canonical Allrecipes--0 / Amazon--0 / GitHub--0 rows.
@@ -126,7 +154,7 @@ def host_of(url: str) -> str:
     return netloc[4:] if netloc.startswith("www.") else netloc
 
 
-def to_row(task: dict, emit_judge_todo: bool = False) -> dict:
+def to_row(task: dict, emit_judge_todo: bool = False, judge: bool = False) -> dict:
     for field in REQUIRED_FIELDS:
         if field not in task:
             raise ValueError(f"task {task.get('id', '<no id>')!r} missing required field {field!r}")
@@ -135,6 +163,11 @@ def to_row(task: dict, emit_judge_todo: bool = False) -> dict:
     verifier_metadata: dict = {"url_contains": host_of(task["web"])}
     if emit_judge_todo:
         verifier_metadata["needs_llm_judge"] = True
+    if judge:
+        # Route verify() to the validated trajectory-level LLM judge (judge.py)
+        # when JUDGE_* env vars are set; url_contains stays as the rule-based
+        # fallback for judge-less runs.
+        verifier_metadata["judge"] = True
     return {
         "responses_create_params": {
             "input": [
@@ -166,6 +199,81 @@ def read_source(path: Path, expected_sha256: str | None, expected_rows: int | No
     return rows
 
 
+def _compact_jsonl(rows: list[dict]) -> bytes:
+    """Serialize rows exactly like the validated pipeline (byte-reproducible)."""
+    return "".join(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows
+    ).encode("utf-8")
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def run_clean(source: Path, output: Path, clean_source_out: Path | None, judge: bool) -> int:
+    """Reproduce the validated webvoyager-clean 168-task set and convert it."""
+    raw = source.read_bytes()
+    actual = _sha256_bytes(raw)
+    if actual != CLEAN_UPSTREAM_SHA256:
+        raise SystemExit(
+            f"upstream WebVoyager_data.jsonl SHA-256 mismatch: got {actual}, "
+            f"expected {CLEAN_UPSTREAM_SHA256} (fetch it with scripts/fetch_webvoyager.sh)"
+        )
+    rows = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
+    if len(rows) != CLEAN_UPSTREAM_ROWS:
+        raise SystemExit(f"upstream row mismatch: got {len(rows)}, expected {CLEAN_UPSTREAM_ROWS}")
+
+    step600 = [r for r in rows if r["web_name"] not in CLEAN_DROP_SITES]
+    blob600 = _compact_jsonl(step600)
+    if len(step600) != CLEAN_600_ROWS or _sha256_bytes(blob600) != CLEAN_600_SHA256:
+        raise SystemExit(
+            f"cleaning step 1 mismatch: rows={len(step600)} sha256={_sha256_bytes(blob600)} "
+            f"(expected {CLEAN_600_ROWS} / {CLEAN_600_SHA256})"
+        )
+
+    step168 = [r for r in step600 if r["web_name"] in CLEAN_KEEP_SITES]
+    blob168 = _compact_jsonl(step168)
+    if len(step168) != CLEAN_168_ROWS or _sha256_bytes(blob168) != CLEAN_168_SHA256:
+        raise SystemExit(
+            f"cleaning step 2 mismatch: rows={len(step168)} sha256={_sha256_bytes(blob168)} "
+            f"(expected {CLEAN_168_ROWS} / {CLEAN_168_SHA256})"
+        )
+
+    expected_ids = [l.strip() for l in CLEAN_TASK_ID_LIST.read_text().splitlines() if l.strip()]
+    actual_ids = [r["id"] for r in step168]
+    if actual_ids != expected_ids:
+        raise SystemExit(
+            "cleaned task IDs do not match data/webvoyager_clean_task_ids.txt "
+            f"(got {len(actual_ids)}, expected {len(expected_ids)})"
+        )
+
+    if clean_source_out is not None:
+        clean_source_out.parent.mkdir(parents=True, exist_ok=True)
+        clean_source_out.write_bytes(blob168)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    converted = [to_row(task, judge=judge) for task in step168]
+    with output.open("w", encoding="utf-8") as handle:
+        for row in converted:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(json.dumps({
+        "pipeline": "webvoyager-clean",
+        "upstream_rows": len(rows),
+        "upstream_sha256": actual,
+        "after_drop_rows": len(step600),
+        "after_drop_sha256": _sha256_bytes(blob600),
+        "clean_rows": len(step168),
+        "clean_source_sha256": _sha256_bytes(blob168),
+        "clean_source_out": str(clean_source_out) if clean_source_out else None,
+        "task_id_list_ok": True,
+        "judge": judge,
+        "output": str(output),
+        "output_rows": len(converted),
+        "output_sha256": _sha256_bytes(output.read_bytes()),
+    }, indent=2))
+    return 0
+
+
 def selftest() -> int:
     rows = [to_row(t) for t in SAMPLE_TASKS]
     assert rows[0]["initial_url"] == "https://www.allrecipes.com/"
@@ -194,6 +302,15 @@ def main() -> int:
     parser.add_argument("--expected-rows", type=int, default=None, help="Fail unless the source has this many rows.")
     parser.add_argument("--emit-judge-todo", action="store_true",
                         help="Mark rows with needs_llm_judge:true (full success requires the LLM judge).")
+    parser.add_argument("--judge", action="store_true",
+                        help="Mark rows with judge:true so verify() uses the validated LLM judge "
+                             "when JUDGE_* env vars are set (url_contains stays as fallback).")
+    parser.add_argument("--clean", action="store_true",
+                        help="Reproduce the validated webvoyager-clean 168-task set from the upstream "
+                             "643-task WebVoyager_data.jsonl (SHA-verified at every step) and convert it.")
+    parser.add_argument("--clean-source-out", type=Path, default=None,
+                        help="With --clean: also write the intermediate 168-row raw task JSONL "
+                             "(byte-identical to the validated run's tasks.jsonl).")
     parser.add_argument("--selftest", action="store_true", help="Convert the 3 bundled sample tasks and validate.")
     args = parser.parse_args()
 
@@ -201,6 +318,8 @@ def main() -> int:
         return selftest()
     if not args.source or not args.output:
         parser.error("--source and --output are required unless --selftest is given")
+    if args.clean:
+        return run_clean(args.source, args.output, args.clean_source_out, judge=args.judge)
 
     rows = read_source(args.source, args.expected_sha256, args.expected_rows)
     if args.offset < 0 or args.offset >= len(rows):
@@ -210,7 +329,9 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
         for task in selected:
-            handle.write(json.dumps(to_row(task, emit_judge_todo=args.emit_judge_todo), ensure_ascii=False) + "\n")
+            handle.write(json.dumps(
+                to_row(task, emit_judge_todo=args.emit_judge_todo, judge=args.judge),
+                ensure_ascii=False) + "\n")
     print(json.dumps({
         "source": str(args.source),
         "output": str(args.output),

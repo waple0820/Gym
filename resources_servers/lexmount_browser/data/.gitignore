@@ -10,3 +10,7 @@ example_rollouts_materialized_inputs.jsonl
 example_rollouts_aggregate_metrics.json
 webvoyager_rollouts_materialized_inputs.jsonl
 webvoyager_rollouts_aggregate_metrics.json
+# fetch_webvoyager.sh artifacts (regenerate; the upstream set is not redistributed)
+webvoyager_data_upstream.jsonl
+webvoyager_clean_source.jsonl
+webvoyager_clean.jsonl
