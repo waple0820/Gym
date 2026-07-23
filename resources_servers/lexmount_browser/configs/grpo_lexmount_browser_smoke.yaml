@@ -56,7 +56,10 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
-  skip_reference_policy_logprobs_calculation: true
+  # false is REQUIRED with the validated KL term: NeMo-RL asserts that skipping
+  # reference-policy logprobs is only allowed when reference_policy_kl_penalty
+  # == 0 (found by the 5090 pre-validation run).
+  skip_reference_policy_logprobs_calculation: false
   seq_logprob_error_threshold: null
   invalid_tool_call_advantage: null
   malformed_thinking_advantage: null
